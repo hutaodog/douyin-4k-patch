@@ -1,4 +1,10 @@
 /* ==== dypc4k begin ==== */
+/* dypc4k v1.2 —— 变更：
+ *   1) 不再钉死编码族（客户端要 h265，而 4K/2K 只存在于 h265）
+ *   2) 档位表里没有 4K 时，钉该列表的最高档（原来直接 return，导致 2K 视频落 720）
+ *   3) 新增"补档位"：用接口返回的 bit_rate 合成播放器条目，补回被客户端裁掉的高档
+ *   4) 底部清晰度标签跟随真实解码分辨率
+ */
 /* 抖音 PC 客户端「固定 4K」— preload 版注入（改文件方案用；CDP 方案不需要这段）
  * 挂在 <版本>\resources\app.asar.unpacked\preload.js 末尾。
  * 只在 https://*.douyin.com 下生效；只写 sessionStorage['MANUAL_SWITCH']。
@@ -24,7 +30,7 @@
     // FIGHT=false：每条视频以 4K 起播；客户端自己降档后不再拉锯（无闪断，稳定）
     var FIGHT = false;
     // 编码族：4K 出现时客户端用的就是这一族；把它钉住，阻止它换到没有 4K 的那一族
-    var LOCK_CODEC = 'h264';
+    var LOCK_CODEC = '';
     // 编码能力改判范围：
     //   'vvc'     只封 H.266/VVC —— 客户端约 8 秒后会迁到 VVC 那一族，那族没有 4K；封掉它，4K(HEVC) 就能留住
     //   'vvc-all' 连 HEVC/AV1 一起封 —— 只留 H.264（实测会把 4K 一起封掉，只剩 1080P）
@@ -144,6 +150,97 @@
     //   curDefinition !== 目标 && 列表里有目标 → changeDefinition 钉回去
     var LOCK_FN = function (CFG) {
 
+      // ================= 档位补充（v1.2）=================
+      // 实测：接口返回的 bit_rate 里有 4K/2K 档，但客户端只把其中一部分放进了播放器的
+      // definition.list（例如某条视频接口给了 13 档含 1440p，播放器里却只有 720/540）。
+      // 这里把接口档位按 uri 索引起来，发现播放器缺高档时，就合成一个条目塞进列表。
+      // 字段与播放器自带条目一一对应（uri / url[{src}] / size / bitrate / definition / isH265 …）。
+      var GEARMAP = {};    // uri -> [{def, gear}]
+      window.__dypc4kGearMap = GEARMAP;
+      function tierDef(h) {
+        return h >= 2160 ? -2 : h >= 1400 ? -1 : h >= 1000 ? 1 : h >= 700 ? 2 : 3;
+      }
+      function captureGears(j) {
+        try {
+          if (!j || typeof j !== 'object') return;
+          var stack = [j], guard = 3000;
+          while (stack.length && guard-- > 0) {
+            var v = stack.pop();
+            if (!v || typeof v !== 'object') continue;
+            if (Array.isArray(v)) { for (var i = 0; i < v.length && i < 80; i++) stack.push(v[i]); continue; }
+            if (v.video && Array.isArray(v.video.bit_rate) && v.video.bit_rate.length) {
+              for (var gi = 0; gi < v.video.bit_rate.length; gi++) {
+                var g = v.video.bit_rate[gi];
+                var pa = (g && g.play_addr) || {};
+                var uri = String(pa.uri || '');
+                if (!uri) continue;
+                var arr = GEARMAP[uri] || (GEARMAP[uri] = []);
+                var h = Math.min(pa.width || 0, pa.height || 0) || Math.max(pa.width || 0, pa.height || 0) || 0;
+                arr.push({ def: tierDef(h), h: h, g: g });
+              }
+            }
+            for (var k in v) { var c = v[k]; if (c && typeof c === 'object') stack.push(c); }
+          }
+        } catch (e) {}
+      }
+      window.__dypc4kCapture = captureGears;
+
+      // 用接口档位合成一个播放器能用的条目
+      function synthEntry(rec) {
+        try {
+          var g = rec.g, pa = g.play_addr || {};
+          var urls = (pa.url_list || []).map(function (u) { return { src: u }; });
+          if (!urls.length) return null;
+          return {
+            vid: String(pa.uri || ''),
+            size: pa.data_size || 0,
+            uri: String(pa.uri || ''),
+            url: urls,
+            bitrate: g.bit_rate || 0,
+            realBitrate: g.bit_rate || 0,
+            definition: rec.def,
+            qualityType: g.quality_type,
+            duration: 0,
+            isH265: !!(g.is_h265 || g.is_bytevc1),
+            gearName: g.gear_name,
+            isH266: false, isHDR: false,
+            vtype: 'normal', mediaType: 'video',
+            codecType: (g.is_h265 || g.is_bytevc1) ? 'h265' : 'h264',
+            fps: g.FPS || 30,
+            width: pa.width, height: pa.height,
+            format: g.format
+          };
+        } catch (e) { return null; }
+      }
+
+      // 给某个播放器的列表补上缺失的高档（返回补进来的档位定义值，没补则返回 null）
+      function fillMissing(list) {
+        try {
+          if (!list || !list.length) return null;
+          var vid = String((list[0] && list[0].uri) || '');
+          if (!vid) return null;
+          var cands = GEARMAP[vid];
+          if (!cands || !cands.length) return null;
+          // 当前列表里最好的档位
+          var bestDef = 99;
+          for (var i = 0; i < list.length; i++) {
+            var d = Number(list[i] && list[i].definition);
+            if (!isNaN(d) && d < bestDef) bestDef = d;
+          }
+          // 接口里最好的档位
+          var best = null;
+          for (var j = 0; j < cands.length; j++) {
+            if (!best || cands[j].def < best.def) best = cands[j];
+          }
+          if (!best || !(best.def < bestDef)) return null;
+          var entry = synthEntry(best);
+          if (!entry) return null;
+          list.push(entry);
+          return best.def;
+        } catch (e) { return null; }
+      }
+      window.__dypc4kFill = fillMissing;
+
       // ============ 让客户端的清晰度标签跟上真实画质 ============
       // 实测：实际已经在播 4K/1080，客户端底部还写着「高清 720P」——那是它自己的 UI 状态，
       // 跟我们写的 MANUAL_SWITCH 不同步。这里只改**文字**，不碰播放逻辑。
@@ -212,6 +309,10 @@
             }
             return n;
           }
+          // 视频请求 URL 修正：实测 channel/aid/主机名都不影响档位表，这里保留一个空的钩子位，
+          // 方便以后发现别的原因时在这里加（当前不做任何改写）。
+          function fixUrl(u) { return u; }
+
           var AB_URL = /ab\/params|mobile\/ab|abtest/i;
           // fetch
           var of = W.fetch;
@@ -219,6 +320,16 @@
             W.fetch = function (input, init) {
               var url = '';
               try { url = String(typeof input === 'string' ? input : (input && input.url) || ''); } catch (e) {}
+              // 补 channel 参数（只在需要时重建请求）
+              try {
+                var fixed = fixUrl(url);
+                if (fixed !== url) {
+                  if (typeof input === 'string') { input = fixed; url = fixed; }
+                  else if (typeof Request !== 'undefined' && input instanceof Request) {
+                    input = new Request(fixed, input); url = fixed;
+                  }
+                }
+              } catch (e) {}
               var p = of.apply(this, arguments);
               if (!AB_URL.test(url)) return p;
               return p.then(function (res) {
@@ -226,6 +337,7 @@
                   var j = null;
                   try { j = JSON.parse(txt); } catch (e) {}
                   if (!j) return new Response(txt, { status: res.status, statusText: res.statusText, headers: res.headers });
+                  try { captureGears(j); } catch (e6) {}
                   var n = patchABObj(j, 0);
                   stat.fetch++; if (n) { stat.changed += n; post('abpatch', 'fetch ' + url.slice(0, 60) + ' changed=' + n + ' [' + stat.keys.join(',') + ']'); }
                   return new Response(JSON.stringify(j), { status: res.status, statusText: res.statusText, headers: res.headers });
@@ -238,7 +350,14 @@
           var XO = W.XMLHttpRequest;
           if (XO && XO.prototype && !XO.prototype.__dypc4k) {
             var xopen = XO.prototype.open;
-            XO.prototype.open = function (m, u) { try { this.__dypc4kUrl = String(u || ''); } catch (e) {} return xopen.apply(this, arguments); };
+            XO.prototype.open = function (m, u) {
+              try {
+                var fu = fixUrl(String(u || ''));
+                if (fu !== String(u || '')) { arguments[1] = fu; u = fu; }
+                this.__dypc4kUrl = String(u || '');
+              } catch (e) {}
+              return xopen.apply(this, arguments);
+            };
             var descText = Object.getOwnPropertyDescriptor(XO.prototype, 'responseText');
             if (descText && descText.get) {
               Object.defineProperty(XO.prototype, 'responseText', {
@@ -247,7 +366,7 @@
                   var t = descText.get.call(this);
                   try {
                     if (this.__dypc4kUrl && AB_URL.test(this.__dypc4kUrl) && this.readyState === 4 && t) {
-                      var j = JSON.parse(t); var n = patchABObj(j, 0);
+                      var j = JSON.parse(t); try { captureGears(j); } catch (e7) {} var n = patchABObj(j, 0);
                       stat.xhr++; if (n) { stat.changed += n; post('abpatch', 'xhr ' + String(this.__dypc4kUrl).slice(0, 60) + ' changed=' + n + ' [' + stat.keys.join(',') + ']'); }
                       return JSON.stringify(j);
                     }
@@ -542,6 +661,22 @@
           var list = defList(p);
           if (!list) return;
           var tgt = entryIn(list, CFG.gear);
+
+          // 【v1.2】列表里没有目标档（4K）时，退而取"该列表里的最高档"。
+          // 之前这块直接 return，导致"只有 2K 的视频"被客户端自己落在 720 上不动。
+          var effTgt = tgt, effDef = CFG.gear;
+          if (!effTgt) {
+            var bestE = null;
+            for (var bi = 0; bi < list.length; bi++) {
+              var e2 = list[bi];
+              if (!e2 || e2.isBackup || e2.definition == null) continue;
+              var d2 = Number(e2.definition);
+              if (isNaN(d2)) continue;
+              if (!bestE || d2 < Number(bestE.definition)) bestE = e2;
+            }
+            if (bestE) { effTgt = bestE; effDef = Number(bestE.definition); }
+          }
+
           if (tgt) {
             good4k[idx] = tgt;                          // 见到就缓存一份
             if (c.codecType !== undefined || c.initCodecType !== undefined) {
@@ -576,14 +711,25 @@
             return;
           }
 
-          // 3) 列表里有 4K，但没在 4K 上 —— 钉回去
-          if (!tgt || atTarget(cur)) return;
+          // 2.5) 播放器列表缺高档？用接口档位补进来，并把目标改成补进来的那一档
+          try {
+            var filled = fillMissing(list);
+            if (filled !== null) {
+              post('inject', 'added definition=' + filled + ' (uri=' + String((list[0] || {}).uri || '').slice(-16) + ')');
+              effTgt = entryIn(list, filled);
+              effDef = filled;
+            }
+          } catch (e5) {}
+
+          // 3) 没在"该列表能给的最高档"上 —— 钉回去（目标可能是 4K，也可能是这条视频最高的 2K）
+          if (!effTgt || Number(cur) === Number(effDef)) return;
           var vkey;
           try { vkey = (p.video && p.video.currentSrc) || ('i' + idx); } catch (e) { vkey = 'i' + idx; }
+          vkey = vkey + '|' + effDef;
           reverts[vkey] = (reverts[vkey] || 0) + 1;
-          if (reverts[vkey] > 3) { post('giveup', 'cur=' + cur + ' reverts>3'); return; }
-          post('revert', 'cur=' + cur + ' -> ' + CFG.gear + ' (#' + reverts[vkey] + ')');
-          try { p.changeDefinition(tgt, p.curDefinition); } catch (e) { post('err', 'changeDefinition: ' + e.message); }
+          if (reverts[vkey] > 5) { post('giveup', 'cur=' + cur + ' eff=' + effDef + ' reverts>5'); return; }
+          post('revert', 'cur=' + cur + ' -> ' + effDef + (effDef === Number(CFG.gear) ? ' (4K)' : ' (该视频最高)') + ' #' + reverts[vkey]);
+          try { p.changeDefinition(effTgt, p.curDefinition); } catch (e) { post('err', 'changeDefinition: ' + e.message); }
         });
         var sig = JSON.stringify(dump.map(function (d) { return [d.playing, d.cur, d.auto, d.gears]; }));
         if (sig !== lastSig) { lastSig = sig; post('state', JSON.stringify(dump)); }
