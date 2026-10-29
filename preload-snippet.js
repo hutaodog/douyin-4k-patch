@@ -1,5 +1,10 @@
 /* ==== dypc4k begin ==== */
-/* dypc4k v1.2 —— 变更：
+/* dypc4k v1.3 —— 变更：
+ *   0) 补档位真正生效：档位采集原来只挂在 AB 分支（视频响应根本进不来），
+ *      且接口档位的 uri 是"每档一个"，改为按 aweme_id 建索引
+ *   1) 画质日志：每条视频记录 实际分辨率/表内最高/接口给到/是否注入 -> %APPDATA%\douyin\dypc4k-quality.log
+ *   2) 视频一开播就巡检（不等 800ms 定时器），缩短"先低后高"的窗口
+ *   ---- 以下为 v1.2 ----
  *   1) 不再钉死编码族（客户端要 h265，而 4K/2K 只存在于 h265）
  *   2) 档位表里没有 4K 时，钉该列表的最高档（原来直接 return，导致 2K 视频落 720）
  *   3) 新增"补档位"：用接口返回的 bit_rate 合成播放器条目，补回被客户端裁掉的高档
@@ -156,6 +161,8 @@
       // 这里把接口档位按 uri 索引起来，发现播放器缺高档时，就合成一个条目塞进列表。
       // 字段与播放器自带条目一一对应（uri / url[{src}] / size / bitrate / definition / isH265 …）。
       var GEARMAP = {};    // uri -> [{def, gear}]
+      var URI2AID = {};    // 任意一档的 uri -> aweme_id
+      var AID2GEARS = {};  // aweme_id -> 该视频全部档位
       window.__dypc4kGearMap = GEARMAP;
       function tierDef(h) {
         return h >= 2160 ? -2 : h >= 1400 ? -1 : h >= 1000 ? 1 : h >= 700 ? 2 : 3;
@@ -176,7 +183,18 @@
                 if (!uri) continue;
                 var arr = GEARMAP[uri] || (GEARMAP[uri] = []);
                 var h = Math.min(pa.width || 0, pa.height || 0) || Math.max(pa.width || 0, pa.height || 0) || 0;
-                arr.push({ def: tierDef(h), h: h, g: g });
+                var rec = { def: tierDef(h), h: h, g: g };
+                arr.push(rec);
+                // 关键：接口的 uri 是"每档一个"，播放器条目的 uri 未必等于它，
+                // 所以再按 aweme_id 建一份索引，用任意一档的 uri 都能反查到整条视频的档位表。
+                try {
+                  var aid = String(v.aweme_id || '');
+                  if (aid) {
+                    URI2AID[uri] = aid;
+                    var bag = AID2GEARS[aid] || (AID2GEARS[aid] = []);
+                    bag.push(rec);
+                  }
+                } catch (e0) {}
               }
             }
             for (var k in v) { var c = v[k]; if (c && typeof c === 'object') stack.push(c); }
@@ -217,10 +235,16 @@
       function fillMissing(list) {
         try {
           if (!list || !list.length) return null;
-          var vid = String((list[0] && list[0].uri) || '');
-          if (!vid) return null;
-          var cands = GEARMAP[vid];
-          if (!cands || !cands.length) return null;
+          // 用列表里任意一档的 uri 反查 aweme_id，再拿这条视频的全部档位
+          var cands = null;
+          for (var li2 = 0; li2 < list.length && !cands; li2++) {
+            var u2 = String((list[li2] && list[li2].uri) || '');
+            if (!u2) continue;
+            var aid2 = URI2AID[u2];
+            if (aid2 && AID2GEARS[aid2] && AID2GEARS[aid2].length) cands = AID2GEARS[aid2];
+            else if (GEARMAP[u2] && GEARMAP[u2].length) cands = GEARMAP[u2];
+          }
+          if (!cands || !cands.length) { try { if (!W.__dypc4kFillDbg) { W.__dypc4kFillDbg = 1; post('fillmiss', 'no cands for ladder uris'); } } catch (e) {} return null; }
           // 当前列表里最好的档位
           var bestDef = 99;
           for (var i = 0; i < list.length; i++) {
@@ -232,10 +256,11 @@
           for (var j = 0; j < cands.length; j++) {
             if (!best || cands[j].def < best.def) best = cands[j];
           }
-          if (!best || !(best.def < bestDef)) return null;
+          if (!best || !(best.def < bestDef)) { try { if (!W.__dypc4kFillDbg2) { W.__dypc4kFillDbg2 = 1; post('fillmiss', 'best=' + (best && best.def) + ' ladderBest=' + bestDef); } } catch (e) {} return null; }
           var entry = synthEntry(best);
-          if (!entry) return null;
+          if (!entry) { try { if (!W.__dypc4kFillDbg3) { W.__dypc4kFillDbg3 = 1; post('fillmiss', 'synthEntry null (urls empty)'); } } catch (e) {} return null; }
           list.push(entry);
+          W.__dypc4kLastInject = Date.now();
           return best.def;
         } catch (e) { return null; }
       }
@@ -331,15 +356,20 @@
                 }
               } catch (e) {}
               var p = of.apply(this, arguments);
-              if (!AB_URL.test(url)) return p;
+              var isAB = AB_URL.test(url);
+              if (!isAB && !VID_URL.test(url)) return p;     // __dypc4kAllHook
               return p.then(function (res) {
                 return res.text().then(function (txt) {
+                  var maybeGear = txt.indexOf('bit_rate') >= 0;
+                  if (!isAB && !maybeGear) return new Response(txt, { status: res.status, statusText: res.statusText, headers: res.headers });
                   var j = null;
                   try { j = JSON.parse(txt); } catch (e) {}
                   if (!j) return new Response(txt, { status: res.status, statusText: res.statusText, headers: res.headers });
-                  try { captureGears(j); } catch (e6) {}
-                  var n = patchABObj(j, 0);
-                  stat.fetch++; if (n) { stat.changed += n; post('abpatch', 'fetch ' + url.slice(0, 60) + ' changed=' + n + ' [' + stat.keys.join(',') + ']'); }
+                  try { if (maybeGear) captureGears(j); } catch (e6) {}
+                  var n = 0;
+                  try { if (isAB) n = patchABObj(j, 0); } catch (e8) {}
+                  if (isAB) { stat.fetch++; if (n) { stat.changed += n; post('abpatch', 'fetch ' + url.slice(0, 60) + ' changed=' + n + ' [' + stat.keys.join(',') + ']'); } }
+                  if (!n && !maybeGear) return new Response(txt, { status: res.status, statusText: res.statusText, headers: res.headers });
                   return new Response(JSON.stringify(j), { status: res.status, statusText: res.statusText, headers: res.headers });
                 });
               });
@@ -365,10 +395,14 @@
                 get: function () {
                   var t = descText.get.call(this);
                   try {
-                    if (this.__dypc4kUrl && AB_URL.test(this.__dypc4kUrl) && this.readyState === 4 && t) {
-                      var j = JSON.parse(t); try { captureGears(j); } catch (e7) {} var n = patchABObj(j, 0);
-                      stat.xhr++; if (n) { stat.changed += n; post('abpatch', 'xhr ' + String(this.__dypc4kUrl).slice(0, 60) + ' changed=' + n + ' [' + stat.keys.join(',') + ']'); }
-                      return JSON.stringify(j);
+                    var isABx = this.__dypc4kUrl && AB_URL.test(this.__dypc4kUrl);
+                    var isGearx = t && t.indexOf('bit_rate') >= 0;
+                    if (this.readyState === 4 && (isABx || isGearx)) {
+                      var j = JSON.parse(t);
+                      try { if (isGearx) captureGears(j); } catch (e7) {}
+                      var n = isABx ? patchABObj(j, 0) : 0;
+                      if (isABx) { stat.xhr++; if (n) { stat.changed += n; post('abpatch', 'xhr ' + String(this.__dypc4kUrl).slice(0, 60) + ' changed=' + n + ' [' + stat.keys.join(',') + ']'); } }
+                      if (n || isGearx) return JSON.stringify(j);
                     }
                   } catch (e) {}
                   return t;
@@ -567,7 +601,7 @@
         return null;
       }
 
-      var reverts = {}, lastSig = '', tickCount = 0, cached = [];
+      var reverts = {}, lastSig = '', tickCount = 0, cached = [], QLOG_SEEN = {};
       var good4k = {}, reinjected = {}, goodCodec = {};   // 缓存 4K 项 / 塞回次数 / 4K 时的编码族
 
       function defList(p) {
@@ -711,6 +745,74 @@
             return;
           }
 
+          // 画质日志：每条视频进来时记一次，4 秒后再记一次"最终结果"
+          try {
+            var quri = String((list[0] && list[0].uri) || '');
+            if (quri) {
+              QLOG_SEEN = QLOG_SEEN || {};
+              var qkey = quri;
+              var bestDefNow = 99;
+              for (var qi = 0; qi < list.length; qi++) {
+                var qd = Number(list[qi] && list[qi].definition);
+                if (!isNaN(qd) && qd < bestDefNow) bestDefNow = qd;
+              }
+              var vEl = null;
+              try {
+                var vs2 = document.querySelectorAll('video');
+                for (var vi2 = 0; vi2 < vs2.length; vi2++) {
+                  if (!vs2[vi2].paused && vs2[vi2].videoHeight > 0) { vEl = vs2[vi2]; break; }
+                }
+              } catch (e8) {}
+              var apiList = [];
+              try {
+                for (var lj = 0; lj < list.length && !apiList.length; lj++) {
+                  var uj = String((list[lj] && list[lj].uri) || '');
+                  if (!uj) continue;
+                  var aj2 = URI2AID[uj];
+                  if (aj2 && AID2GEARS[aj2] && AID2GEARS[aj2].length) apiList = AID2GEARS[aj2];
+                  else if (GEARMAP[uj] && GEARMAP[uj].length) apiList = GEARMAP[uj];
+                }
+              } catch (e9) {}
+              var apiBest = 99;
+              for (var aj = 0; aj < apiList.length; aj++) {
+                if (apiList[aj] && apiList[aj].def < apiBest) apiBest = apiList[aj].def;
+              }
+              var snap = {
+                uri: quri.slice(-14),
+                injected: (W.__dypc4kLastInject && (Date.now() - W.__dypc4kLastInject) < 6000) ? '是' : '否',
+                apiCount: apiList.length,
+                apiBest: apiBest === 99 ? null : apiBest,
+                ladder: list.length,
+                best: bestDefNow,
+                cur: cur,
+                sel: c.userSelectDefinition,
+                h: vEl ? vEl.videoHeight : 0,
+                w: vEl ? vEl.videoWidth : 0,
+                auto: c.needAutoBitrate,
+                codec: String(c.codecType || ''),
+                gears: list.map(function (x) { return (x.definition) + '@' + Math.min(x.width || 0, x.height || 0) + (x.isH265 ? 'h5' : 'h4'); }).join(',')
+              };
+              if (!QLOG_SEEN[qkey]) {
+                QLOG_SEEN[qkey] = 1;
+                post('qlog', JSON.stringify({ phase: 'enter', s: snap }));
+                (function (uriKey, snapRef) {
+                  setTimeout(function () {
+                    try {
+                      var vs3 = document.querySelectorAll('video'), ve = null;
+                      for (var k3 = 0; k3 < vs3.length; k3++) {
+                        if (!vs3[k3].paused && vs3[k3].videoHeight > 0) { ve = vs3[k3]; break; }
+                      }
+                      snapRef.h = ve ? ve.videoHeight : 0;
+                      snapRef.w = ve ? ve.videoWidth : 0;
+                      snapRef.uri = uriKey;
+                      post('qlog', JSON.stringify({ phase: 'final', s: snapRef }));
+                    } catch (e9) {}
+                  }, 4000);
+                })(qkey.slice(-14), snap);
+              }
+            }
+          } catch (e7) {}
+
           // 2.5) 播放器列表缺高档？用接口档位补进来，并把目标改成补进来的那一档
           try {
             var filled = fillMissing(list);
@@ -756,6 +858,13 @@
           post('ok', 'players=' + ps.length);
           setInterval(step, 800);
           step();
+          // 视频一开播就立刻补一次（__dypc4kFastStep），把"先 540 后 4K"的窗口压到最小
+          try {
+            var fast = function () { setTimeout(step, 30); setTimeout(step, 200); setTimeout(step, 600); };
+            document.addEventListener('playing', fast, true);
+            document.addEventListener('loadedmetadata', fast, true);
+            document.addEventListener('canplay', fast, true);
+          } catch (e) {}
           return;
         }
         setTimeout(boot, 500);
@@ -1154,6 +1263,33 @@
           var size = 0;
           try { size = fsl.statSync(lockLog).size; } catch (e) {}
           if (size > 512 * 1024) fsl.truncateSync(lockLog, 0);
+          if (d.kind === 'qlog') {
+            // 画质日志：独立文件，便于事后排查"刷着刷着变糊"
+            try {
+              var qf = pl.join(process.env.APPDATA + '\\douyin', 'dypc4k-quality.log');
+              var qs = 0;
+              try { qs = fsl.statSync(qf).size; } catch (e) {}
+              if (qs > 2 * 1024 * 1024) fsl.truncateSync(qf, 0);
+              var o = JSON.parse(d.data);
+              var s2 = o.s || {};
+              var defName = function (d2) {
+                return d2 === -2 ? '4K' : d2 === -1 ? '2K' : d2 === 1 ? '1080' : d2 === 2 ? '720' : d2 === 3 ? '540' : String(d2);
+              };
+              var line = new Date().toLocaleString('zh-CN') + '\t[' + o.phase + ']' +
+                '\t实际=' + (s2.w + 'x' + s2.h) +
+                '\t清晰度档=' + defName(s2.cur) +
+                '\t选中=' + defName(s2.sel) +
+                '\t表内最高=' + defName(s2.best) + '(' + s2.ladder + '档)' +
+                '\t注入=' + (s2.injected || '否') +
+                '\t接口给到=' + (s2.apiBest == null ? '无记录' : defName(s2.apiBest) + '(' + s2.apiCount + '档)') +
+                '\t编码=' + s2.codec +
+                '\tauto=' + s2.auto +
+                '\turi=' + s2.uri +
+                '\t档位表=' + String(s2.gears || '').slice(0, 120) + '\n';
+              fsl.appendFileSync(qf, line);
+              return;
+            } catch (e) {}
+          }
           fsl.appendFileSync(lockLog,
             new Date().toISOString().slice(11, 23) + '\t' + d.kind + '\t' +
             (typeof d.data === 'string' ? d.data : JSON.stringify(d.data)) + '\n');
