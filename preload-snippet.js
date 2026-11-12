@@ -664,18 +664,61 @@
       //   canplay 早在 3ms 内就对着旧流触发 -> Promise resolve 但流没换。
       // 所以：把 entry.url 归一成字符串，走 media.src 那条真正换流的路。
       // 另一个坑：<source> 子元素存在时浏览器会忽略 media.src（HTML 规范），必须先清干净。
+      // 【v1.5 bugfix】实测出现过 entry.url === 5（数字）导致 forceChange 把 media.src
+      // 设成 "5" 的情况：换流静默失败，而 <video> 还停在旧流上，看起来像"钉了没反应"。
+      // 所以这里改成：把所有可能的取址位置都试一遍，并且只接受 http(s) 开头的串。
+      function httpish(s) {
+        if (typeof s !== 'string') return '';
+        s = s.replace(/^\s+|\s+$/g, '');
+        if (!/^https?:\/\//i.test(s)) return '';
+        return s;
+      }
+      function pickUrl(v) {
+        if (!v) return '';
+        if (typeof v === 'string') return httpish(v);
+        if (Array.isArray(v)) {
+          for (var i = 0; i < v.length; i++) {
+            var got = pickUrl(v[i]);
+            if (got) return got;
+          }
+          return '';
+        }
+        if (typeof v === 'object') {
+          var cand = [v.src, v.url, v.Src, v.Url, v.playUrl, v.play_url];
+          for (var j = 0; j < cand.length; j++) {
+            var g2 = pickUrl(cand[j]);
+            if (g2) return g2;
+          }
+        }
+        return '';
+      }
       function urlOf(entry) {
         try {
-          var u = entry && entry.url;
-          if (Array.isArray(u)) {
-            for (var i = 0; i < u.length; i++) {
-              var s = u[i] && (u[i].src || u[i].url);
-              if (s) return String(s);
+          if (!entry) return '';
+          var slots = [
+            entry.url, entry.urlList, entry.url_list, entry.playUrl, entry.play_url,
+            entry.playAddr, entry.play_addr
+          ];
+          for (var i = 0; i < slots.length; i++) {
+            var s = pickUrl(slots[i]);
+            if (s) return s;
+            if (slots[i] && typeof slots[i] === 'object' && !Array.isArray(slots[i])) {
+              var nested = pickUrl(slots[i].url_list || slots[i].urlList);
+              if (nested) return nested;
             }
-            return '';
           }
-          if (u && typeof u === 'object') return String(u.src || u.url || '');
-          return u ? String(u) : '';
+          // 全都不是 http 串：记下真实形状，方便下次定位（只记一次，避免刷屏）
+          try {
+            W.__dypc4kBadUrl = W.__dypc4kBadUrl || {};
+            var k = String(entry.definition);
+            if (!W.__dypc4kBadUrl[k]) {
+              W.__dypc4kBadUrl[k] = 1;
+              post('badurl', 'def=' + k + ' urlType=' + Object.prototype.toString.call(entry.url) +
+                   ' url=' + String(entry.url).slice(0, 60) +
+                   ' keys=' + Object.keys(entry).join('/').slice(0, 160));
+            }
+          } catch (eB) {}
+          return '';
         } catch (e) { return ''; }
       }
 
@@ -684,7 +727,10 @@
           var m = p.media || p.video;
           if (!m) { post('err', 'force: no media'); return false; }
           var url = urlOf(entry);
-          if (!url) { post('err', 'force: empty url def=' + def); return false; }
+          if (!url) {
+            post('err', 'force: no http url def=' + def + ' urlType=' + Object.prototype.toString.call(entry && entry.url));
+            return false;
+          }
           // 同一条视频短时间内只换一次。换源后 currentSrc 变空/变新，step() 的防抖 key 会失效，
           // 而 step() 会被 30/200/600ms 的 FastStep 和多播放器实例重复触发 —— 不节流就会
           // 连续 reset 同一个 <video>，表现是分辨率迟迟不上去。
