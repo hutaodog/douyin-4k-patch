@@ -244,7 +244,7 @@ $content = [regex]::Replace($content, "(?s)\r?\n?/\* ==== dypc4k-probe2 begin ==
 $snip = [System.IO.File]::ReadAllText($Snippet, [System.Text.Encoding]::UTF8)
 $snip = $snip -replace "var TARGET = '[^']+';", "var TARGET = '$Target';"
 $snip = $snip -replace "var FIGHT = (true|false);", 'var FIGHT = false;'
-$snip = $snip -replace "var LOCK_CODEC = '[^']*';", "var LOCK_CODEC = 'h264';"
+$snip = $snip -replace "var LOCK_CODEC = '[^']*';", "var LOCK_CODEC = '';"
 $snip = $snip -replace "var REFUSE = '[^']*';", "var REFUSE = 'vvc';"
 $snip = $snip -replace "var AB_PATCH = (true|false);", 'var AB_PATCH = true;'
 
